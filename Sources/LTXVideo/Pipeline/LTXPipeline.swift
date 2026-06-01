@@ -1134,9 +1134,14 @@ public actor LTXPipeline {
         profiler.start("VAE Decode")
 
         profiler.start("VAE Forward Pass")
+        let vaeTileSize = memoryOptimization.effectiveVAETemporalTileSize(
+            latentFrames: videoLatent.dim(2),
+            latentHeight: videoLatent.dim(3),
+            latentWidth: videoLatent.dim(4)
+        )
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+            temporalTileSize: vaeTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
@@ -1598,9 +1603,14 @@ public actor LTXPipeline {
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
         profiler.start("VAE Decode")
+        let vaeTileSize = memoryOptimization.effectiveVAETemporalTileSize(
+            latentFrames: videoLatent.dim(2),
+            latentHeight: videoLatent.dim(3),
+            latentWidth: videoLatent.dim(4)
+        )
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+            temporalTileSize: vaeTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)
@@ -1996,9 +2006,14 @@ public actor LTXPipeline {
             currentStep: totalSteps, totalSteps: totalSteps, sigma: 0, phase: .decoding
         ))
         LTXMemoryManager.setPhase(.vaeDecode)
+        let vaeTileSize = memoryOptimization.effectiveVAETemporalTileSize(
+            latentFrames: videoLatent.dim(2),
+            latentHeight: videoLatent.dim(3),
+            latentWidth: videoLatent.dim(4)
+        )
         let videoTensor = decodeVideo(
             latent: videoLatent, decoder: vaeDecoder, timestep: nil,
-            temporalTileSize: memoryOptimization.vaeTemporalTileSize,
+            temporalTileSize: vaeTileSize,
             temporalTileOverlap: memoryOptimization.vaeTemporalTileOverlap
         )
         MLX.eval(videoTensor)

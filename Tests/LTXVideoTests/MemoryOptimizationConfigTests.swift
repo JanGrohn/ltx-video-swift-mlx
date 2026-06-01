@@ -17,6 +17,7 @@ struct MemoryOptimizationConfigTests {
         #expect(!config.unloadAfterUse)
         #expect(config.unloadSleepSeconds == 0)
         #expect(config.vaeTemporalTileSize == 0)
+        #expect(!config.vaeAutoTemporalTiling)
     }
 
     @Test func testLightPreset() {
@@ -26,6 +27,7 @@ struct MemoryOptimizationConfigTests {
         #expect(config.unloadAfterUse)
         #expect(config.unloadSleepSeconds == 0.3)
         #expect(config.vaeTemporalTileSize == 0)
+        #expect(config.vaeAutoTemporalTiling)
     }
 
     @Test func testModeratePreset() {
@@ -80,7 +82,9 @@ struct MemoryOptimizationConfigTests {
             unloadAfterUse: false,
             unloadSleepSeconds: 2.0,
             vaeTemporalTileSize: 10,
-            vaeTemporalTileOverlap: 2
+            vaeTemporalTileOverlap: 2,
+            vaeAutoTemporalTiling: false,
+            vaeDecodeMemoryBudgetGB: 6.5
         )
         #expect(config.evalFrequency == 3)
         #expect(config.clearCacheOnEval)
@@ -88,5 +92,108 @@ struct MemoryOptimizationConfigTests {
         #expect(config.unloadSleepSeconds == 2.0)
         #expect(config.vaeTemporalTileSize == 10)
         #expect(config.vaeTemporalTileOverlap == 2)
+        #expect(!config.vaeAutoTemporalTiling)
+        #expect(config.vaeDecodeMemoryBudgetGB == 6.5)
+    }
+
+    @Test func testAutoTileSizeFitsBudget() {
+        let config = MemoryOptimizationConfig(
+            vaeTemporalTileSize: 0,
+            vaeTemporalTileOverlap: 1,
+            vaeAutoTemporalTiling: true,
+            vaeDecodeMemoryBudgetGB: 8.0
+        )
+
+        // Small latent should fit and keep single-pass decode.
+        let tileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 9,
+            latentHeight: 16,
+            latentWidth: 16,
+            systemRAMGB: 64
+        )
+        #expect(tileSize == 0)
+    }
+
+    @Test func testAutoTileSizeTriggersWhenOverBudget() {
+        let config = MemoryOptimizationConfig(
+            vaeTemporalTileSize: 0,
+            vaeTemporalTileOverlap: 1,
+            vaeAutoTemporalTiling: true,
+            vaeDecodeMemoryBudgetGB: 2.0
+        )
+
+        // 1080p-ish latent (33x60) and long sequence should force tiling.
+        let tileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 100,
+            latentHeight: 33,
+            latentWidth: 60,
+            systemRAMGB: 64
+        )
+        #expect(tileSize > 0)
+        #expect(tileSize >= 2)
+    }
+
+    @Test func testAutoTileSizeAccountsForDecodedOutputMemory() {
+        let config = MemoryOptimizationConfig(
+            vaeTemporalTileSize: 0,
+            vaeTemporalTileOverlap: 1,
+            vaeAutoTemporalTiling: true,
+            vaeDecodeMemoryBudgetGB: 2.0
+        )
+
+        // The decoder activation alone would fit under 2 GB here, but the
+        // retained decoded video makes full decode much larger.
+        let tileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 20,
+            latentHeight: 33,
+            latentWidth: 60,
+            systemRAMGB: 64,
+            currentMLXMemoryBytes: 0
+        )
+        #expect(tileSize > 0)
+    }
+
+    @Test func testAutoTileSizeAccountsForResidentMLXMemory() {
+        let config = MemoryOptimizationConfig(
+            vaeTemporalTileSize: 0,
+            vaeTemporalTileOverlap: 1,
+            vaeAutoTemporalTiling: true,
+            vaeDecodeMemoryBudgetGB: nil
+        )
+
+        let fullBudgetTileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 60,
+            latentHeight: 33,
+            latentWidth: 60,
+            systemRAMGB: 64,
+            currentMLXMemoryBytes: 0
+        )
+        let constrainedTileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 60,
+            latentHeight: 33,
+            latentWidth: 60,
+            systemRAMGB: 64,
+            currentMLXMemoryBytes: 30 * 1_073_741_824
+        )
+
+        #expect(fullBudgetTileSize == 0)
+        #expect(constrainedTileSize > 0)
+    }
+
+    @Test func testManualTileSizeOverridesAuto() {
+        let config = MemoryOptimizationConfig(
+            vaeTemporalTileSize: 7,
+            vaeTemporalTileOverlap: 1,
+            vaeAutoTemporalTiling: true,
+            vaeDecodeMemoryBudgetGB: 2.0
+        )
+
+        let tileSize = config.effectiveVAETemporalTileSize(
+            latentFrames: 100,
+            latentHeight: 33,
+            latentWidth: 60,
+            systemRAMGB: 64
+        )
+        #expect(tileSize == 7)
     }
 }

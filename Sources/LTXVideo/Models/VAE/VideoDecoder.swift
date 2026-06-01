@@ -390,8 +390,17 @@ private func decodeWithTemporalTiling(
     // Pixel overlap = 8 * overlap (each latent frame expands to ~8 pixels)
     let pixelOverlap = 8 * overlap
 
-    var decodedChunks: [MLXArray] = []  // Each is (B, C, F_chunk, H, W)
+    // Pre-compute blend weights once (vectorized, not CPU loop)
+    let blendWeights: MLXArray?
+    if pixelOverlap > 0 {
+        blendWeights = MLX.linspace(Float(0), Float(1), count: pixelOverlap)
+            .reshaped([1, 1, pixelOverlap, 1, 1])
+    } else {
+        blendWeights = nil
+    }
+
     var chunkIdx = 0
+    var result: MLXArray?
 
     var start = 0
     while start < totalLatentFrames {
@@ -402,58 +411,41 @@ private func decodeWithTemporalTiling(
         let decoded = decoder(chunk)
         eval(decoded)  // eval per tile (needed to bound memory)
 
-        decodedChunks.append(decoded)
+        if let currentResult = result {
+            let resultFrames = currentResult.dim(2)
+            let nextFrames = decoded.dim(2)
+
+            if let weights = blendWeights, pixelOverlap < resultFrames && pixelOverlap < nextFrames {
+                // Extract overlap regions
+                let resultOverlap = currentResult[0..., 0..., (resultFrames - pixelOverlap)..., 0..., 0...]
+                let nextOverlap = decoded[0..., 0..., 0..<pixelOverlap, 0..., 0...]
+
+                // Blend: linear interpolation
+                let blended = resultOverlap * (1 - weights) + nextOverlap * weights
+
+                // Concatenate: result[:-overlap] + blended + next[overlap:]
+                let resultPart = currentResult[0..., 0..., 0..<(resultFrames - pixelOverlap), 0..., 0...]
+                let nextPart = decoded[0..., 0..., pixelOverlap..., 0..., 0...]
+                result = MLX.concatenated([resultPart, blended, nextPart], axis: 2)
+            } else {
+                // No overlap — just concatenate
+                result = MLX.concatenated([currentResult, decoded], axis: 2)
+            }
+        } else {
+            result = decoded
+        }
+
+        Memory.clearCache()  // Release each tile promptly to keep peak memory down
         chunkIdx += 1
 
         if end >= totalLatentFrames { break }
         start += stride
     }
-    Memory.clearCache()  // Single clear after all tiles decoded
 
-    if decodedChunks.count == 1 {
-        // Single chunk — no blending needed
-        let decoded = decodedChunks[0]
-        var frames = MLX.clip((decoded + 1.0) / 2.0, min: 0.0, max: 1.0)
-        frames = frames[0]
-        frames = frames.transposed(1, 2, 3, 0)
-        return frames
+    guard let result else {
+        fatalError("decodeWithTemporalTiling produced no output chunks")
     }
 
-    // Pre-compute blend weights once (vectorized, not CPU loop)
-    let blendWeights: MLXArray?
-    if pixelOverlap > 0 {
-        blendWeights = MLX.linspace(Float(0), Float(1), count: pixelOverlap)
-            .reshaped([1, 1, pixelOverlap, 1, 1])
-    } else {
-        blendWeights = nil
-    }
-
-    // Blend overlapping regions with linear interpolation
-    LTXDebug.log("Blending \(decodedChunks.count) temporal tiles (pixel overlap=\(pixelOverlap))")
-    var result = decodedChunks[0]
-
-    for i in 1..<decodedChunks.count {
-        let next = decodedChunks[i]
-        let resultFrames = result.dim(2)
-        let nextFrames = next.dim(2)
-
-        if let weights = blendWeights, pixelOverlap < resultFrames && pixelOverlap < nextFrames {
-            // Extract overlap regions
-            let resultOverlap = result[0..., 0..., (resultFrames - pixelOverlap)..., 0..., 0...]
-            let nextOverlap = next[0..., 0..., 0..<pixelOverlap, 0..., 0...]
-
-            // Blend: linear interpolation
-            let blended = resultOverlap * (1 - weights) + nextOverlap * weights
-
-            // Concatenate: result[:-overlap] + blended + next[overlap:]
-            let resultPart = result[0..., 0..., 0..<(resultFrames - pixelOverlap), 0..., 0...]
-            let nextPart = next[0..., 0..., pixelOverlap..., 0..., 0...]
-            result = MLX.concatenated([resultPart, blended, nextPart], axis: 2)
-        } else {
-            // No overlap — just concatenate
-            result = MLX.concatenated([result, next], axis: 2)
-        }
-    }
     eval(result)  // Single eval after all blending
 
     LTXDebug.log("VAE tiled output: \(result.shape)")

@@ -2,6 +2,7 @@
 // Copyright 2025
 
 import Foundation
+@preconcurrency import MLX
 
 /// Controls how aggressively the pipeline manages GPU memory during generation.
 ///
@@ -47,13 +48,23 @@ public struct MemoryOptimizationConfig: Sendable {
     /// VAE temporal tile overlap (latent frames). Blended with linear interpolation.
     public var vaeTemporalTileOverlap: Int
 
+    /// Automatically enable VAE temporal tiling when decode activations are estimated
+    /// to exceed a memory budget. Manual `vaeTemporalTileSize > 0` takes precedence.
+    public var vaeAutoTemporalTiling: Bool
+
+    /// Optional memory budget (GB) used by automatic VAE temporal tiling.
+    /// If nil, a budget is derived from current MLX allocations and total system RAM.
+    public var vaeDecodeMemoryBudgetGB: Double?
+
     public init(
         evalFrequency: Int = 4,
         clearCacheOnEval: Bool = false,
         unloadAfterUse: Bool = true,
         unloadSleepSeconds: Double = 0.5,
         vaeTemporalTileSize: Int = 0,
-        vaeTemporalTileOverlap: Int = 1
+        vaeTemporalTileOverlap: Int = 1,
+        vaeAutoTemporalTiling: Bool = true,
+        vaeDecodeMemoryBudgetGB: Double? = nil
     ) {
         self.evalFrequency = evalFrequency
         self.clearCacheOnEval = clearCacheOnEval
@@ -61,6 +72,8 @@ public struct MemoryOptimizationConfig: Sendable {
         self.unloadSleepSeconds = unloadSleepSeconds
         self.vaeTemporalTileSize = vaeTemporalTileSize
         self.vaeTemporalTileOverlap = vaeTemporalTileOverlap
+        self.vaeAutoTemporalTiling = vaeAutoTemporalTiling
+        self.vaeDecodeMemoryBudgetGB = vaeDecodeMemoryBudgetGB
     }
 
     // MARK: - Presets
@@ -71,7 +84,8 @@ public struct MemoryOptimizationConfig: Sendable {
         clearCacheOnEval: false,
         unloadAfterUse: false,
         unloadSleepSeconds: 0,
-        vaeTemporalTileSize: 0
+        vaeTemporalTileSize: 0,
+        vaeAutoTemporalTiling: false
     )
 
     /// Light optimization — eval every 4 blocks, unload after use
@@ -80,7 +94,8 @@ public struct MemoryOptimizationConfig: Sendable {
         clearCacheOnEval: false,
         unloadAfterUse: true,
         unloadSleepSeconds: 0.3,
-        vaeTemporalTileSize: 0
+        vaeTemporalTileSize: 0,
+        vaeAutoTemporalTiling: true
     )
 
     /// Moderate optimization — eval every 2 blocks, clear cache, VAE tiling
@@ -90,7 +105,8 @@ public struct MemoryOptimizationConfig: Sendable {
         unloadAfterUse: true,
         unloadSleepSeconds: 0.5,
         vaeTemporalTileSize: 8,
-        vaeTemporalTileOverlap: 1
+        vaeTemporalTileOverlap: 1,
+        vaeAutoTemporalTiling: true
     )
 
     /// Aggressive optimization — eval every block, clear cache, VAE tiling
@@ -100,7 +116,8 @@ public struct MemoryOptimizationConfig: Sendable {
         unloadAfterUse: true,
         unloadSleepSeconds: 1.0,
         vaeTemporalTileSize: 6,
-        vaeTemporalTileOverlap: 1
+        vaeTemporalTileOverlap: 1,
+        vaeAutoTemporalTiling: true
     )
 
     /// Default preset
@@ -118,5 +135,151 @@ public struct MemoryOptimizationConfig: Sendable {
         default:
             return .disabled
         }
+    }
+
+    /// Resolve the effective temporal tile size (latent frames) for VAE decode.
+    ///
+    /// Returns 0 when full decode is estimated to fit the selected budget.
+    public func effectiveVAETemporalTileSize(
+        latentFrames: Int,
+        latentHeight: Int,
+        latentWidth: Int,
+        systemRAMGB: Int? = nil,
+        currentMLXMemoryBytes: Int? = nil,
+        activationBytesPerScalar: Int = 4
+    ) -> Int {
+        if vaeTemporalTileSize > 0 {
+            return vaeTemporalTileSize
+        }
+
+        guard vaeAutoTemporalTiling, latentFrames > 0 else {
+            return 0
+        }
+
+        let budgetBytes = effectiveVAEDecodeBudgetBytes(
+            systemRAMGB: systemRAMGB,
+            currentMLXMemoryBytes: currentMLXMemoryBytes
+        )
+        guard budgetBytes > 0 else {
+            return 0
+        }
+
+        let estimatedFullDecodeBytes = Self.estimatedVAEFullDecodeBytes(
+            latentFrames: latentFrames,
+            latentHeight: latentHeight,
+            latentWidth: latentWidth,
+            activationBytesPerScalar: activationBytesPerScalar
+        )
+        if estimatedFullDecodeBytes <= budgetBytes {
+            LTXDebug.log(
+                "VAE auto-tiling decision: budget=\(Self.formatBytesForLog(budgetBytes)), estimate=\(Self.formatBytesForLog(estimatedFullDecodeBytes)), full decode"
+            )
+            return 0
+        }
+
+        let nonTemporalBytes = Self.estimatedVAENonTemporalDecodeBytes(
+            latentFrames: latentFrames,
+            latentHeight: latentHeight,
+            latentWidth: latentWidth,
+            bytesPerScalar: activationBytesPerScalar
+        )
+        let bytesPerLatentFrame = Self.estimatedVAEPeakActivationBytesPerLatentFrame(
+            latentHeight: latentHeight,
+            latentWidth: latentWidth,
+            bytesPerScalar: activationBytesPerScalar
+        )
+
+        let usableTemporalBytes = max(0, budgetBytes - nonTemporalBytes)
+        let maxLatentFrames = max(2, Int(usableTemporalBytes / max(1, bytesPerLatentFrame)))
+        let tileSize = max(vaeTemporalTileOverlap + 1, maxLatentFrames)
+        LTXDebug.log(
+            "VAE auto-tiling decision: budget=\(Self.formatBytesForLog(budgetBytes)), estimate=\(Self.formatBytesForLog(estimatedFullDecodeBytes)), tile=\(tileSize), overlap=\(vaeTemporalTileOverlap)"
+        )
+        return tileSize
+    }
+
+    /// Effective decode budget in bytes for automatic VAE tiling.
+    ///
+    /// When an explicit budget is provided, uses it directly. Otherwise derives a
+    /// budget from total RAM after reserving headroom for the OS and subtracting
+    /// current MLX allocations already resident in unified memory.
+    public func effectiveVAEDecodeBudgetBytes(
+        systemRAMGB: Int? = nil,
+        currentMLXMemoryBytes: Int? = nil
+    ) -> Int64 {
+        if let budgetGB = vaeDecodeMemoryBudgetGB {
+            return Int64(max(0.0, budgetGB) * 1_073_741_824.0)
+        }
+
+        let systemBytes = Int64((systemRAMGB ?? Self.detectedSystemRAMGB()) * 1_073_741_824)
+        let mlxBytes = Int64(currentMLXMemoryBytes ?? Self.detectedCurrentMLXMemoryBytes())
+        let reservedSystemBytes = max(4 * 1_073_741_824, systemBytes / 4)
+
+        return max(0, systemBytes - reservedSystemBytes - mlxBytes)
+    }
+
+    /// Detect total system memory in GB.
+    public static func detectedSystemRAMGB() -> Int {
+        let bytes = ProcessInfo.processInfo.physicalMemory
+        return max(1, Int(bytes / 1_073_741_824))
+    }
+
+    /// Detect current MLX memory already resident in unified memory.
+    public static func detectedCurrentMLXMemoryBytes() -> Int {
+        let snapshot = Memory.snapshot()
+        return snapshot.activeMemory + snapshot.cacheMemory
+    }
+
+    /// Estimated bytes per latent frame for the largest VAE working activation.
+    static func estimatedVAEPeakActivationBytesPerLatentFrame(
+        latentHeight: Int,
+        latentWidth: Int,
+        bytesPerScalar: Int
+    ) -> Int64 {
+        Int64(512) * 4 * Int64(latentHeight * 4) * Int64(latentWidth * 4) * Int64(bytesPerScalar)
+    }
+
+    /// Estimated bytes for the non-temporal portion of decode memory.
+    ///
+    /// Includes the decoded BCHW tensor, the normalized/transposed output tensor,
+    /// and a small extra slack for elementwise post-processing.
+    static func estimatedVAENonTemporalDecodeBytes(
+        latentFrames: Int,
+        latentHeight: Int,
+        latentWidth: Int,
+        bytesPerScalar: Int
+    ) -> Int64 {
+        let pixelFrames = max(1, 8 * (latentFrames - 1) + 1)
+        let pixelHeight = latentHeight * 32
+        let pixelWidth = latentWidth * 32
+        let outputBytes = Int64(pixelFrames) * Int64(pixelHeight) * Int64(pixelWidth) * 3 * Int64(bytesPerScalar)
+        let postProcessSlack = max(Int64(256 * 1_048_576), outputBytes / 10)
+        return outputBytes * 2 + postProcessSlack
+    }
+
+    /// Estimated total bytes required for a full non-tiled VAE decode.
+    static func estimatedVAEFullDecodeBytes(
+        latentFrames: Int,
+        latentHeight: Int,
+        latentWidth: Int,
+        activationBytesPerScalar: Int
+    ) -> Int64 {
+        let activationBytes = estimatedVAEPeakActivationBytesPerLatentFrame(
+            latentHeight: latentHeight,
+            latentWidth: latentWidth,
+            bytesPerScalar: activationBytesPerScalar
+        ) * Int64(latentFrames)
+        let nonTemporalBytes = estimatedVAENonTemporalDecodeBytes(
+            latentFrames: latentFrames,
+            latentHeight: latentHeight,
+            latentWidth: latentWidth,
+            bytesPerScalar: activationBytesPerScalar
+        )
+        return activationBytes + nonTemporalBytes
+    }
+
+    private static func formatBytesForLog(_ bytes: Int64) -> String {
+        let gib = Double(bytes) / 1_073_741_824.0
+        return String(format: "%.1f GiB", gib)
     }
 }
